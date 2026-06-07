@@ -1,0 +1,294 @@
+"""
+renovation_model.py
+====================
+Renovation Cost Estimator — Group 15 · Politecnico di Milano
+Python reference implementation of the calculation logic.
+
+Methodology
+-----------
+- ISO 15686-8:2008 Factor Method (simplified age-vs-RSL form)
+- k=2 cumulative deterioration curve:
+      d(t) = 0                                         if age <= RSL_min
+      d(t) = ((age - RSL_min) / (RSL_max - RSL_min))² if RSL_min < age < RSL_max
+      d(t) = 1                                         if age >= RSL_max
+- Reference: Daniotti & Lupica Spagnolo (2008), 11DBMC Istanbul, paper T 41
+- Price reference: Prezzario LOM252 (DGR XII/4571, 16 June 2025)
+- Currency / locale: Milan, Italy (EUR)
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# CONSTANTS — current year (used to compute building age)
+# ---------------------------------------------------------------------------
+CURRENT_YEAR: int = 2026
+
+# ---------------------------------------------------------------------------
+# PIPE MATERIAL DATABASE
+# Reference: Idraulico Catania — "Quando sostituire i tubi d'acqua"
+# URL: https://www.idraulicocatania.org/blog/quando-sostituire-i-tubi-d-acqua
+# ---------------------------------------------------------------------------
+PIPE_MATERIALS: Dict[str, Dict] = {
+    "galvanized": {"name": "Galvanized steel", "rsl_min": 20, "rsl_max": 40},
+    "cast_iron":  {"name": "Cast iron",         "rsl_min": 40, "rsl_max": 80},
+    "brass":      {"name": "Brass",             "rsl_min": 40, "rsl_max": 80},
+    "copper":     {"name": "Copper",            "rsl_min": 50, "rsl_max": 80},
+    "pvc":        {"name": "PVC",               "rsl_min": 50, "rsl_max": 80},
+}
+
+# ---------------------------------------------------------------------------
+# COMPONENT DATABASE
+# Each component has RSL range and source citation.
+# Components marked use_pipe_material=True inherit RSL from the chosen pipe.
+# ---------------------------------------------------------------------------
+COMPONENTS: Dict[str, Dict] = {
+    "plumbing_pipes": {
+        "name": "Plumbing pipes",
+        "use_pipe_material": True,
+        "citation": "Idraulico Catania — Quando sostituire i tubi d'acqua",
+        "url": "https://www.idraulicocatania.org/blog/quando-sostituire-i-tubi-d-acqua",
+    },
+    "drain_pipes": {
+        "name": "Drain pipes",
+        "use_pipe_material": True,
+        "citation": "Idraulico Catania — Quando sostituire i tubi d'acqua",
+        "url": "https://www.idraulicocatania.org/blog/quando-sostituire-i-tubi-d-acqua",
+    },
+    "electrical_wiring": {
+        "name": "Electrical wiring",
+        "rsl_min": 25,
+        "rsl_max": 40,
+        "citation": "Elettroforniture 2000 — Quando rifare l'impianto elettrico",
+        "url": "https://www.elettroforniture2000.it/quando-rifare-limpianto-elettrico-ecco-i-segnali-a-cui-stare-attenti/",
+    },
+    "waterproofing": {
+        "name": "Waterproofing membrane",
+        "rsl_min": 10,
+        "rsl_max": 25,
+        "citation": "Winkler Chimica — Quanto dura un'impermeabilizzazione",
+        "url": "https://winklerchimica.com/quanto-dura-impermeabilizzazione/",
+    },
+    "tile_adhesive": {
+        "name": "Tile adhesive & grout",
+        "rsl_min": 30,
+        "rsl_max": 50,
+        "citation": "Reformas con Arte — Vita utile degli elementi del bagno",
+        "url": "https://reformasconarte.es/it/blog/vida-util-elementos-bano-cuando-cambiarlos/",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# ROOM TYPE → COMPONENT RISK MAPPING
+# ---------------------------------------------------------------------------
+ROOM_TYPES: Dict[str, Dict] = {
+    "kitchen":     {"name": "Kitchen",     "risks": ["plumbing_pipes", "drain_pipes", "electrical_wiring"]},
+    "bathroom":    {"name": "Bathroom",    "risks": ["plumbing_pipes", "waterproofing", "tile_adhesive"]},
+    "living_room": {"name": "Living Room", "risks": ["electrical_wiring"]},
+    "bedroom":     {"name": "Bedroom",     "risks": ["electrical_wiring"]},
+    "balcony":     {"name": "Balcony",     "risks": ["waterproofing", "tile_adhesive", "drain_pipes"]},
+}
+
+# ---------------------------------------------------------------------------
+# DATA CLASSES
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RiskInput:
+    """Per-component input for one room."""
+    replacement_cost_per_m2: float   # EUR/m² replacement cost (from computo metrico)
+    enabled: bool = True             # False → exclude this risk from calculation
+
+
+@dataclass
+class Room:
+    """A single room in the building."""
+    room_type: str                               # key in ROOM_TYPES
+    area_m2: float                               # net floor area (m²)
+    rate_per_m2: float                           # renovation rate EUR/m² (from PM / Prezzario)
+    risks: Dict[str, RiskInput] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Auto-populate missing risk entries with a default cost of 0
+        for comp_key in ROOM_TYPES[self.room_type]["risks"]:
+            if comp_key not in self.risks:
+                self.risks[comp_key] = RiskInput(replacement_cost_per_m2=0.0)
+
+
+@dataclass
+class BuildingProject:
+    """Top-level project definition."""
+    construction_year: int
+    pipe_material: str = "copper"     # key in PIPE_MATERIALS
+    rooms: List[Room] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# CORE CALCULATION FUNCTIONS
+# ---------------------------------------------------------------------------
+
+def building_age(project: BuildingProject) -> int:
+    """Return building age in years (relative to CURRENT_YEAR)."""
+    return max(0, CURRENT_YEAR - project.construction_year)
+
+
+def get_rsl(comp_key: str, pipe_material: str) -> tuple[int, int]:
+    """Return (rsl_min, rsl_max) for a component, resolving pipe material where needed."""
+    comp = COMPONENTS[comp_key]
+    if comp.get("use_pipe_material"):
+        m = PIPE_MATERIALS[pipe_material]
+        return m["rsl_min"], m["rsl_max"]
+    return comp["rsl_min"], comp["rsl_max"]
+
+
+def deterioration_fraction(age: int, rsl_min: int, rsl_max: int) -> float:
+    """
+    k=2 cumulative deterioration model (ISO 15686-8 simplified).
+
+    Returns a value in [0.0, 1.0]:
+        0.0  — component is within service life (age <= rsl_min)
+        1.0  — component is fully deteriorated (age >= rsl_max)
+        t²   — non-linear acceleration between rsl_min and rsl_max
+    """
+    if age <= rsl_min:
+        return 0.0
+    if age >= rsl_max:
+        return 1.0
+    t = (age - rsl_min) / (rsl_max - rsl_min)
+    return t ** 2
+
+
+def calculate(project: BuildingProject) -> dict:
+    """
+    Run the full cost estimate for a BuildingProject.
+
+    Returns a dict with:
+        age           : int   — building age in years
+        total_base    : float — sum of (area × rate) over all rooms (EUR)
+        total_det     : float — sum of deterioration-adjusted costs (EUR)
+        total         : float — base + deterioration (EUR)
+        rooms         : list  — per-room breakdown (see below)
+
+    Each room entry in 'rooms':
+        room_type, area_m2, rate_per_m2,
+        room_base     : float — area × rate
+        risks         : list of dicts with keys:
+            comp_key, comp_name, rsl_min, rsl_max,
+            det_fraction, det_pct,
+            replacement_cost_per_m2,
+            added_cost    : float — area × replacement_cost × det_fraction
+    """
+    age = building_age(project)
+    total_base = 0.0
+    total_det = 0.0
+    room_results = []
+
+    for room in project.rooms:
+        rt = ROOM_TYPES[room.room_type]
+        room_base = room.area_m2 * room.rate_per_m2
+        total_base += room_base
+
+        risk_results = []
+        for comp_key in rt["risks"]:
+            rsl_min, rsl_max = get_rsl(comp_key, project.pipe_material)
+            det = deterioration_fraction(age, rsl_min, rsl_max)
+            risk_input = room.risks.get(comp_key, RiskInput(0.0))
+            repl_cost = risk_input.replacement_cost_per_m2 if risk_input.enabled else 0.0
+            added_cost = room.area_m2 * repl_cost * det
+            total_det += added_cost
+
+            risk_results.append({
+                "comp_key":   comp_key,
+                "comp_name":  COMPONENTS[comp_key]["name"],
+                "rsl_min":    rsl_min,
+                "rsl_max":    rsl_max,
+                "det_fraction": det,
+                "det_pct":    round(det * 100, 2),
+                "replacement_cost_per_m2": risk_input.replacement_cost_per_m2,
+                "enabled":    risk_input.enabled,
+                "added_cost": round(added_cost, 2),
+            })
+
+        room_results.append({
+            "room_type":    room.room_type,
+            "area_m2":      room.area_m2,
+            "rate_per_m2":  room.rate_per_m2,
+            "room_base":    round(room_base, 2),
+            "risks":        risk_results,
+        })
+
+    return {
+        "age":         age,
+        "total_base":  round(total_base, 2),
+        "total_det":   round(total_det, 2),
+        "total":       round(total_base + total_det, 2),
+        "rooms":       room_results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# REPORT PRINTER
+# ---------------------------------------------------------------------------
+
+def print_report(result: dict) -> None:
+    """Print a formatted cost report to stdout."""
+    SEP = "─" * 68
+    print(f"\n{'RENOVATION COST ESTIMATE':^68}")
+    print(f"{'Politecnico di Milano · Group 15':^68}")
+    print(SEP)
+    print(f"  Building age : {result['age']} years")
+    print(SEP)
+
+    for rr in result["rooms"]:
+        print(f"\n  {ROOM_TYPES[rr['room_type']]['name'].upper()}  "
+              f"({rr['area_m2']} m² × €{rr['rate_per_m2']}/m²)")
+        print(f"  {'Room base cost':35s} € {rr['room_base']:>10,.2f}")
+        for risk in rr["risks"]:
+            status = f"{risk['det_pct']:5.1f}%"
+            print(f"    {risk['comp_name']:33s} det={status}  "
+                  f"added=€{risk['added_cost']:>8,.2f}")
+
+    print(f"\n{SEP}")
+    print(f"  {'Base cost (Σ area × rate)':35s} € {result['total_base']:>10,.2f}")
+    print(f"  {'Deterioration cost':35s} € {result['total_det']:>10,.2f}")
+    print(f"  {'─'*50}")
+    print(f"  {'TOTAL ESTIMATE':35s} € {result['total']:>10,.2f}")
+    print(f"{SEP}\n")
+
+
+# ---------------------------------------------------------------------------
+# EXAMPLE — 1965 Milan apartment (matches HTML default sample)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    project = BuildingProject(
+        construction_year=1965,
+        pipe_material="copper",
+        rooms=[
+            Room("bathroom", area_m2=6, rate_per_m2=950, risks={
+                "plumbing_pipes": RiskInput(80),
+                "waterproofing":  RiskInput(55),
+                "tile_adhesive":  RiskInput(45),
+            }),
+            Room("kitchen", area_m2=12, rate_per_m2=1200, risks={
+                "plumbing_pipes":    RiskInput(80),
+                "drain_pipes":       RiskInput(70),
+                "electrical_wiring": RiskInput(35),
+            }),
+            Room("bedroom", area_m2=14, rate_per_m2=180, risks={
+                "electrical_wiring": RiskInput(30),
+            }),
+            Room("living_room", area_m2=22, rate_per_m2=200, risks={
+                "electrical_wiring": RiskInput(30),
+            }),
+            Room("balcony", area_m2=8, rate_per_m2=280, risks={
+                "waterproofing":  RiskInput(60),
+                "tile_adhesive":  RiskInput(50),
+                "drain_pipes":    RiskInput(65),
+            }),
+        ],
+    )
+
+    result = calculate(project)
+    print_report(result)
