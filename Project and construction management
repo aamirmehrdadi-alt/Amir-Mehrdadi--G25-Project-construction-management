@@ -1,7 +1,7 @@
 """
 renovation_model.py
 ====================
-Renovation Cost Estimator — Group 15 · Politecnico di Milano
+Renovation Cost Estimator — Group 25 · Politecnico di Milano
 Python reference implementation of the calculation logic.
 
 Methodology
@@ -235,7 +235,7 @@ def print_report(result: dict) -> None:
     """Print a formatted cost report to stdout."""
     SEP = "─" * 68
     print(f"\n{'RENOVATION COST ESTIMATE':^68}")
-    print(f"{'Politecnico di Milano · Group 15':^68}")
+    print(f"{'Politecnico di Milano · Group 25':^68}")
     print(SEP)
     print(f"  Building age : {result['age']} years")
     print(SEP)
